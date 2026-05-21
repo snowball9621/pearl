@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pearl-start
+pearl-watchdog start
+pearl-monitor-heartbeat start || true
+
+echo
+echo "Pearl is up."
+echo "Use: pearl-status"
