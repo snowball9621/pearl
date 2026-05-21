@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck disable=SC1091
+. /usr/local/bin/pearl-env
+
+mode="${1:-all}"
+
+stop_pids() {
+  pattern="$1"
+  for pid in $(pgrep -f "$pattern" 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    kill "$pid" 2>/dev/null || true
+  done
+}
+
+if [ "$mode" = "all" ] || [ "$mode" = "miners" ]; then
+  stop_pids "$INSTALL_DIR/alpha-miner"
+  rm -f "$RUN_DIR"/gpu*.pid
+fi
+
+if [ "$mode" = "all" ] || [ "$mode" = "watchdog" ]; then
+  pearl-watchdog stop || true
+fi
+
+if [ "$mode" = "all" ] || [ "$mode" = "heartbeat" ]; then
+  pearl-monitor-heartbeat stop || true
+fi
+
+if [ "$mode" = "all" ] || [ "$mode" = "tunnel" ]; then
+  pearl-tunnel stop || true
+fi
+
+echo "stopped: $mode"
