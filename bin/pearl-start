@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck disable=SC1091
+. /usr/local/bin/pearl-env
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+
+if [ ! -x "$INSTALL_DIR/alpha-miner" ]; then
+  echo "alpha-miner not found: $INSTALL_DIR/alpha-miner"
+  echo "Run: bash install.sh"
+  exit 1
+fi
+
+if [ "$USE_RELAY" = "1" ]; then
+  pearl-tunnel start
+  EFFECTIVE_POOL="127.0.0.1"
+  EFFECTIVE_PORT="$RELAY_LOCAL_PORT"
+else
+  EFFECTIVE_POOL="$POOL_HOST"
+  EFFECTIVE_PORT="$POOL_PORT"
+fi
+
+pkill -f "$INSTALL_DIR/alpha-miner" 2>/dev/null || true
+rm -f "$RUN_DIR"/gpu*.pid
+sleep 1
+
+mapfile -t GPUS < <(nvidia-smi --query-gpu=index --format=csv,noheader,nounits | tr -d ' ')
+if [ "${#GPUS[@]}" -eq 0 ]; then
+  echo "No NVIDIA GPU found"
+  exit 1
+fi
+
+prefix="$WORKER_PREFIX"
+if [ -z "$prefix" ]; then
+  prefix="$(hostname)"
+fi
+
+for gpu in "${GPUS[@]}"; do
+  log="$LOG_DIR/gpu${gpu}.log"
+  pid="$RUN_DIR/gpu${gpu}.pid"
+  : > "$log"
+  nohup "$INSTALL_DIR/alpha-miner" \
+    --devices "$gpu" \
+    --pool "stratum+tcp://${EFFECTIVE_POOL}:${EFFECTIVE_PORT}" \
+    --address "$WALLET" \
+    --worker "${prefix}-gpu${gpu}" \
+    --password "x;d=${DIFF}" \
+    --status-interval 30 \
+    >> "$log" 2>&1 &
+  echo $! > "$pid"
+  echo "started gpu=$gpu pid=$(cat "$pid") log=$log"
+done
+
+sleep 8
+pearl-status
