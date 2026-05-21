@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck disable=SC1091
+. /usr/local/bin/pearl-env
+
+PID_FILE="$RUN_DIR/heartbeat.pid"
+LOG_FILE="$LOG_DIR/heartbeat.log"
+
+json_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/\\/\\\\/g' \
+    -e 's/"/\\"/g' \
+    -e 's/\r/\\r/g' \
+    -e 's/\t/\\t/g'
+}
+
+trim() {
+  sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+machine_id() {
+  if [ -n "$MACHINE_ID" ]; then
+    echo "$MACHINE_ID"
+  else
+    hostname
+  fi
+}
+
+once() {
+  if [ -z "$MONITOR_TOKEN" ]; then
+    echo "MONITOR_TOKEN is empty; heartbeat disabled"
+    return 0
+  fi
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+
+  id="$(machine_id)"
+  now="$(date +%s)"
+  iso="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  host="$(hostname 2>/dev/null || true)"
+
+  gpus_json=""
+  gpu_count=0
+  while IFS=, read -r idx name util power mem_used mem_total; do
+    idx="$(printf '%s' "$idx" | trim)"
+    name="$(printf '%s' "$name" | trim)"
+    util="$(printf '%s' "$util" | trim)"
+    power="$(printf '%s' "$power" | trim)"
+    mem_used="$(printf '%s' "$mem_used" | trim)"
+    mem_total="$(printf '%s' "$mem_total" | trim)"
+    [ -z "$idx" ] && continue
+    [ -n "$gpus_json" ] && gpus_json="$gpus_json,"
+    gpus_json="$gpus_json{\"index\":${idx:-0},\"name\":\"$(json_escape "$name")\",\"utilization_gpu\":${util:-0},\"power_w\":${power:-0},\"memory_used_mib\":${mem_used:-0},\"memory_total_mib\":${mem_total:-0}}"
+    gpu_count=$((gpu_count + 1))
+  done < <(nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true)
+
+  tunnel_ok=false
+  if [ "$USE_RELAY" = "1" ] && timeout 3 bash -c "</dev/tcp/127.0.0.1/${RELAY_LOCAL_PORT}" >/dev/null 2>&1; then
+    tunnel_ok=true
+  elif [ "$USE_RELAY" != "1" ]; then
+    tunnel_ok=true
+  fi
+
+  miner_proc="$(pgrep -fc "$INSTALL_DIR/alpha-miner" 2>/dev/null || true)"
+  hashrate_th_s="$(
+    for file in "$LOG_DIR"/gpu*.log; do
+      [ -f "$file" ] || continue
+      grep -Eo 'hashrate_th_s=[0-9.]+' "$file" 2>/dev/null | tail -n 1 | cut -d= -f2
+    done | awk '{sum += $1} END {printf "%.3f", sum + 0}'
+  )"
+
+  last_share="$(
+    grep -h 'share submitted' "$LOG_DIR"/gpu*.log 2>/dev/null \
+      | sort \
+      | tail -n 1 \
+      | awk '{print $1}'
+  )"
+  last_share_epoch=0
+  if [ -n "$last_share" ]; then
+    last_share_epoch="$(date -d "$last_share" +%s 2>/dev/null || echo 0)"
+  fi
+
+  warns_recent=0
+  last_warn=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    ts="${line%% *}"
+    epoch="$(date -d "$ts" +%s 2>/dev/null || echo 0)"
+    if [ "$epoch" -gt 0 ] && [ $((now - epoch)) -le 300 ]; then
+      warns_recent=$((warns_recent + 1))
+      last_warn="$line"
+    fi
+  done < <(grep -hEi 'WARN|ERROR|connection_lost|timeout|share dropped|reconnect|connection reset' "$LOG_DIR"/gpu*.log 2>/dev/null | tail -n 300)
+
+  payload="$RUN_DIR/heartbeat.json"
+  cat > "$payload" <<JSON
+{"id":"$(json_escape "$id")","hostname":"$(json_escape "$host")","ssh_host":"","ssh_port":"","wallet":"$(json_escape "$WALLET")","time_epoch":$now,"time_iso":"$(json_escape "$iso")","gpus":[$gpus_json],"gpu_count":$gpu_count,"tunnel_ok":$tunnel_ok,"tunnel_proc":0,"miner_proc":${miner_proc:-0},"logs":[],"shares_recent":0,"warns_recent":$warns_recent,"last_share":"$(json_escape "$last_share")","last_share_epoch":${last_share_epoch:-0},"last_warn":"$(json_escape "$last_warn")","hashrate_th_s":${hashrate_th_s:-0}}
+JSON
+
+  curl -fsS --max-time 8 \
+    -H "Authorization: Bearer ${MONITOR_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data-binary "@${payload}" \
+    "${MONITOR_URL%/}/api/heartbeat" >/dev/null
+}
+
+run() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  echo $$ > "$PID_FILE"
+  while true; do
+    once >> "$LOG_FILE" 2>&1 || true
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+alive() {
+  [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+start() {
+  if [ -z "$MONITOR_TOKEN" ]; then
+    echo "heartbeat disabled: MONITOR_TOKEN is empty"
+    return 0
+  fi
+  if alive; then
+    echo "heartbeat already running pid=$(cat "$PID_FILE")"
+    return 0
+  fi
+  nohup "$0" run >> "$LOG_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+  echo "heartbeat started pid=$(cat "$PID_FILE")"
+}
+
+stop() {
+  if alive; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+}
+
+case "${1:-once}" in
+  once) once ;;
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  run) run ;;
+  *) echo "usage: pearl-monitor-heartbeat [once|start|stop|restart|run]"; exit 2 ;;
+esac
