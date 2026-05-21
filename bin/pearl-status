@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck disable=SC1091
+. /usr/local/bin/pearl-env
+
+echo "--- pearl ---"
+echo "wallet=$WALLET"
+echo "install_dir=$INSTALL_DIR"
+if [ "$USE_RELAY" = "1" ]; then
+  pearl-tunnel status || true
+else
+  echo "pool=${POOL_HOST}:${POOL_PORT}"
+fi
+
+echo "--- processes ---"
+ps -eo pid,ppid,etime,cmd | grep -E "$INSTALL_DIR/alpha-miner|pearl-watchdog|pearl-monitor-heartbeat" | grep -v grep || true
+
+echo "--- gpu ---"
+nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits || true
+
+echo "--- recent logs ---"
+for log in "$LOG_DIR"/gpu*.log; do
+  [ -f "$log" ] || continue
+  echo "### $log"
+  grep -E 'connected|challenge_received|hashrate_th_s|share submitted|WARN|ERROR|connection_lost|share dropped|reconnect' "$log" | tail -12 || true
+done
