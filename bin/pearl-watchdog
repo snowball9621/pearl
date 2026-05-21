@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# shellcheck disable=SC1091
+. /usr/local/bin/pearl-env
+
+PID_FILE="$RUN_DIR/watchdog.pid"
+LOG_FILE="$LOG_DIR/watchdog.log"
+
+alive() {
+  [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+gpu_count() {
+  nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null | wc -l | awk '{print $1}'
+}
+
+miner_count() {
+  pgrep -fc "$INSTALL_DIR/alpha-miner" 2>/dev/null || true
+}
+
+min_gpu_util() {
+  nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null \
+    | awk '{gsub(/ /, "", $1); if (NR == 1 || $1 < min) min = $1} END {if (NR) print int(min); else print 0}'
+}
+
+last_share_age() {
+  latest="$(
+    grep -h 'share submitted' "$LOG_DIR"/gpu*.log 2>/dev/null \
+      | awk '{print $1}' \
+      | sort \
+      | tail -n 1
+  )"
+  if [ -z "$latest" ]; then
+    echo 999999
+    return
+  fi
+  ts="$(date -d "$latest" +%s 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if [ "$ts" -le 0 ]; then
+    echo 999999
+  else
+    echo $((now - ts))
+  fi
+}
+
+loop() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  echo $$ > "$PID_FILE"
+  low_count=0
+  last_restart=0
+  echo "$(date -Is) watchdog started" >> "$LOG_FILE"
+
+  while true; do
+    expected="$(gpu_count)"
+    miners="$(miner_count)"
+    util="$(min_gpu_util)"
+    share_age="$(last_share_age)"
+    now="$(date +%s)"
+
+    if [ "$USE_RELAY" = "1" ]; then
+      pearl-tunnel start >> "$LOG_FILE" 2>&1 || true
+    fi
+
+    reason=""
+    if [ "$expected" -gt 0 ] && [ "$miners" -lt "$expected" ]; then
+      reason="miner_count_${miners}_lt_gpu_${expected}"
+    elif [ "$((now - last_restart))" -gt "$STARTUP_GRACE" ] && [ "$util" -lt "$IDLE_THRESHOLD" ]; then
+      low_count=$((low_count + 1))
+      if [ "$low_count" -ge "$IDLE_LIMIT" ]; then
+        reason="gpu_idle_min_${util}"
+      fi
+    else
+      low_count=0
+    fi
+
+    if [ -z "$reason" ] && [ "$share_age" -gt "$STALE_SHARE_SECONDS" ]; then
+      reason="stale_share_${share_age}s"
+    fi
+
+    if [ -n "$reason" ]; then
+      echo "$(date -Is) restart reason=$reason miners=$miners gpus=$expected min_util=$util share_age=$share_age" >> "$LOG_FILE"
+      pearl-start >> "$LOG_FILE" 2>&1 || true
+      last_restart="$(date +%s)"
+      low_count=0
+    fi
+
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+start() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  if alive; then
+    echo "watchdog already running pid=$(cat "$PID_FILE")"
+    return 0
+  fi
+  nohup "$0" run >> "$LOG_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+  echo "watchdog started pid=$(cat "$PID_FILE")"
+}
+
+stop() {
+  if alive; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+}
+
+status() {
+  if alive; then
+    echo "watchdog: running pid=$(cat "$PID_FILE")"
+  else
+    echo "watchdog: stopped"
+    return 1
+  fi
+}
+
+case "${1:-start}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  run) loop ;;
+  *) echo "usage: pearl-watchdog [start|stop|restart|status|run]"; exit 2 ;;
+esac
