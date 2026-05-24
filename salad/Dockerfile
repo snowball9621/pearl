@@ -1,5 +1,7 @@
 FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04
 
+LABEL org.opencontainers.image.title="pearl-salad"
+
 ARG ALPHA_MINER_URL=https://github.com/AlphaMine-Tech/alpha-miner/releases/latest/download/alpha-miner
 
 RUN apt-get update \
